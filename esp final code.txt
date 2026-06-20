@@ -1,0 +1,326 @@
+/*
+  ==========================================
+  Driver Monitoring System - ESP32 Controller
+  ==========================================
+  Hardware:
+    - ESP32 DevKit V1
+    - L298N motor driver (drive motors only, no steering board)
+    - 2 DC drive motors
+    - Active buzzer
+    - Windows laptop running Python + OpenCV + MediaPipe, connected via USB serial
+
+  Pin connections:
+    Buzzer:
+      BUZZER_PIN = GPIO 26
+
+    L298N:
+      IN1 = GPIO 13
+      IN2 = GPIO 12
+      ENA = GPIO 25
+      IN3 = GPIO 32
+      IN4 = GPIO 33
+      ENB = GPIO 27
+
+  Serial Protocol (one character per line from laptop):
+    'S'  -> Sleep/no-face ESCALATION START. Sent by Python only after eyes have
+            been closed (or face has been missing) continuously for 5 seconds.
+            ESP32 turns the buzzer ON immediately on receiving 'S', then stops
+            the motors 5 seconds later if no 'W' arrives (10s total from the
+            moment the driver's eyes actually closed / face actually disappeared).
+    'W'  -> WAKE / face or eyes back to normal.
+            Cancels escalation at any stage, buzzer OFF, motors resume automatically.
+    'T'  -> Distraction beep (driver looked away >= 3s). Short beep (~1.5s), no motor stop.
+    'Y'  -> Yawn beep (5 yawns counted). Short beep (1s), no motor stop.
+    'H'  -> Heartbeat. Laptop sends this periodically so ESP32 knows the link is alive.
+            Does NOT touch the buzzer - it only confirms the laptop link is alive.
+
+  Escalation timeline:
+    t=-5s  : Driver's eyes actually close / face actually disappears (tracked on
+             the Python side - NOT sent to the ESP32 yet).
+    t=0s   : Python has now confirmed 5s of continuous eyes-closed/no-face and
+             sends 'S'. ESP32 turns buzzer ON immediately.
+    t=5s   : (5s after 'S') Motors stop. Buzzer stays ON until 'W' is received.
+    Any 'W' received before the 5s motor-stop mark cancels everything immediately
+    (buzzer OFF, motors keep running / resume).
+
+  Distraction and yawn beeps are independent, short, non-blocking alerts that do
+  NOT affect the escalation timer or the motors. If an escalation alarm is already
+  sounding, a distraction/yawn beep request is ignored (escalation alarm takes priority).
+
+  Safety fail-safe:
+    If no serial data at all (not even 'H') is received for 5 seconds, assume the
+    laptop crashed / cable unplugged / Python crashed. FAIL-SAFE: stop both motors
+    immediately. This is independent of, and in addition to, the escalation logic.
+
+  ESP32-specific notes:
+    - This sketch does NOT use analogWrite() for PWM (unreliable on ESP32 core).
+      ENA/ENB are driven using the ESP32's LEDC hardware PWM peripheral via the
+      pin-based API (ledcAttach / ledcWrite) for ESP32 Arduino core 3.x.
+    - The buzzer is driven with plain digitalWrite(HIGH/LOW), NOT tone()/noTone().
+      tone()/noTone() reconfigure the pin's underlying timer/PWM hardware and will
+      fight with digitalWrite() calls elsewhere in this sketch, causing the buzzer
+      to appear to "not work" even though the logic correctly says it's ON. Do not
+      mix tone()/noTone() with digitalWrite() on BUZZER_PIN anywhere in this file.
+*/
+
+// ==========================================
+// Pin Definitions
+// ==========================================
+
+const int BUZZER_PIN = 26;
+
+const int DRIVE_IN1 = 13;
+const int DRIVE_IN2 = 12;
+const int DRIVE_IN3 = 32;
+const int DRIVE_IN4 = 33;
+
+const int DRIVE_ENA = 25;
+const int DRIVE_ENB = 27;
+
+// ==========================================
+// LEDC (ESP32 hardware PWM) Configuration
+// ==========================================
+
+const int LEDC_FREQUENCY  = 5000;
+const int LEDC_RESOLUTION = 8;
+
+// ==========================================
+// Timing Configuration
+// ==========================================
+
+const unsigned long ESCALATION_BUZZ_DELAY_MS = 5000;   // time from buzzer-ON to motor-stop
+const unsigned long DISTRACTION_BEEP_MS      = 1500;
+const unsigned long YAWN_BEEP_MS             = 1000;
+const unsigned long SERIAL_TIMEOUT_MS        = 5000;
+const int DRIVE_SPEED = 150;
+
+// ==========================================
+// State - Escalation (sleep / no-face)
+// ==========================================
+
+bool escalationActive   = false;
+unsigned long escalationStartTime = 0;
+bool escalationBuzzing  = false;
+bool escalationStopped  = false;
+
+// ==========================================
+// State - Short beeps (distraction / yawn)
+// ==========================================
+
+bool shortBeepActive = false;
+unsigned long shortBeepStartTime = 0;
+unsigned long shortBeepDuration  = 0;
+
+// ==========================================
+// State - General
+// ==========================================
+
+unsigned long lastSerialTime = 0;
+bool failSafeTripped = false;
+bool motorsRunning   = false;
+
+// ==========================================
+// Motor Helper Functions
+// ==========================================
+
+void driveStop() {
+  digitalWrite(DRIVE_IN1, LOW);
+  digitalWrite(DRIVE_IN2, LOW);
+  digitalWrite(DRIVE_IN3, LOW);
+  digitalWrite(DRIVE_IN4, LOW);
+
+  ledcWrite(DRIVE_ENA, 0);
+  ledcWrite(DRIVE_ENB, 0);
+
+  if (motorsRunning) {
+    Serial.println("[MOTOR] STOPPED");
+    motorsRunning = false;
+  }
+}
+
+void driveForward() {
+  digitalWrite(DRIVE_IN1, HIGH);
+  digitalWrite(DRIVE_IN2, LOW);
+
+  digitalWrite(DRIVE_IN3, HIGH);
+  digitalWrite(DRIVE_IN4, LOW);
+
+  ledcWrite(DRIVE_ENA, DRIVE_SPEED);
+  ledcWrite(DRIVE_ENB, DRIVE_SPEED);
+
+  if (!motorsRunning) {
+    Serial.println("[MOTOR] STARTED (forward, moderate speed)");
+    motorsRunning = true;
+  }
+}
+
+// ==========================================
+// Buzzer Helper Functions
+// ==========================================
+// IMPORTANT: only ever use digitalWrite() on BUZZER_PIN. Never call
+// tone()/noTone() on this pin anywhere in the sketch.
+
+void buzzerOn() {
+  digitalWrite(BUZZER_PIN, HIGH);
+}
+
+void buzzerOff() {
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// ==========================================
+// Escalation control
+// ==========================================
+
+void startEscalation() {
+  if (!escalationActive) {
+    escalationActive  = true;
+    escalationStopped = false;
+    escalationStartTime = millis();
+
+    // Python already waited 5s of confirmed eyes-closed/no-face before
+    // sending 'S', so the buzzer starts immediately here - no additional
+    // silent wait on the ESP32 side. The ESP32 only times the next 5s
+    // until the motors stop (10s total from the driver's actual condition).
+    escalationBuzzing = true;
+    buzzerOn();
+    Serial.println("[ESCALATION] 'S' received -> buzzer ON immediately, motor stop in 5s");
+  }
+}
+
+void cancelEscalation() {
+  if (escalationActive || escalationBuzzing || escalationStopped) {
+    Serial.println("[ESCALATION] 'W' received -> cancelled, buzzer OFF, resuming motors");
+  }
+  escalationActive  = false;
+  escalationBuzzing = false;
+  escalationStopped = false;
+  buzzerOff();
+  driveForward();
+}
+
+void updateEscalation() {
+  if (!escalationActive) return;
+
+  unsigned long elapsed = millis() - escalationStartTime;
+
+  // Buzzer is already ON (set in startEscalation). Just watch for the
+  // 5-second mark to stop the motors.
+  if (!escalationStopped && elapsed >= ESCALATION_BUZZ_DELAY_MS) {
+    escalationStopped = true;
+    Serial.println("[ESCALATION] 5s of buzzing elapsed -> stopping motors (buzzer remains ON)");
+    driveStop();
+  }
+}
+
+// ==========================================
+// Short beep control (distraction / yawn)
+// ==========================================
+
+void requestShortBeep(unsigned long durationMs, const char* label) {
+  if (escalationBuzzing) {
+    Serial.print("[BEEP] ");
+    Serial.print(label);
+    Serial.println(" ignored - escalation alarm already sounding");
+    return;
+  }
+
+  shortBeepActive = true;
+  shortBeepStartTime = millis();
+  shortBeepDuration = durationMs;
+  buzzerOn();
+
+  Serial.print("[BEEP] ");
+  Serial.print(label);
+  Serial.println(" beep started");
+}
+
+void updateShortBeep() {
+  if (!shortBeepActive) return;
+
+  if (millis() - shortBeepStartTime >= shortBeepDuration) {
+    shortBeepActive = false;
+
+    if (!escalationBuzzing) {
+      buzzerOff();
+    }
+
+    Serial.println("[BEEP] finished");
+  }
+}
+
+// ==========================================
+// Setup
+// ==========================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  Serial.println("==========================================");
+  Serial.println("[BOOT] ESP32 Driver Monitoring Controller starting...");
+
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  pinMode(DRIVE_IN1, OUTPUT);
+  pinMode(DRIVE_IN2, OUTPUT);
+  pinMode(DRIVE_IN3, OUTPUT);
+  pinMode(DRIVE_IN4, OUTPUT);
+
+  ledcAttach(DRIVE_ENA, LEDC_FREQUENCY, LEDC_RESOLUTION);
+  ledcAttach(DRIVE_ENB, LEDC_FREQUENCY, LEDC_RESOLUTION);
+  Serial.println("[BOOT] LEDC PWM configured for ENA/ENB");
+
+  buzzerOff();
+
+  driveForward();
+
+  lastSerialTime = millis();
+
+  Serial.println("[BOOT] ESP32 Driver Monitoring Controller READY");
+  Serial.println("==========================================");
+}
+
+// ==========================================
+// Main Loop
+// ==========================================
+
+void loop() {
+
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    lastSerialTime = millis();
+
+    if (failSafeTripped) {
+      Serial.println("[FAILSAFE] Serial link recovered - fail-safe latch cleared");
+      failSafeTripped = false;
+    }
+
+    if (c == 'S') {
+      Serial.println("[STATE] SLEEP / NO-FACE detected");
+      startEscalation();
+    }
+    else if (c == 'W') {
+      Serial.println("[STATE] AWAKE / FACE DETECTED");
+      cancelEscalation();
+    }
+    else if (c == 'T') {
+      requestShortBeep(DISTRACTION_BEEP_MS, "DISTRACTION");
+    }
+    else if (c == 'Y') {
+      requestShortBeep(YAWN_BEEP_MS, "YAWN");
+    }
+    else if (c == 'H') {
+      Serial.println("[HEARTBEAT] received");
+    }
+  }
+
+  updateEscalation();
+  updateShortBeep();
+
+  if (!failSafeTripped && (millis() - lastSerialTime >= SERIAL_TIMEOUT_MS)) {
+    failSafeTripped = true;
+    Serial.println("[FAILSAFE] No serial data for 5s (heartbeat lost / laptop crash / cable unplugged) - stopping motors");
+    driveStop();
+  }
+}
